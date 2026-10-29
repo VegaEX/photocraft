@@ -1,7 +1,9 @@
 //! Keyboard layer navigation, the shortcuts that have no menu item (#352): ⌥] / ⌥[ select the
 //! layer above / below, ⌥. / ⌥, the top / bottom layer, and ⇧⌥] / ⇧⌥[ add the layer above /
-//! below to the selection. They follow the Layers panel's rows, top to bottom: a group's row comes
-//! before its children, and the children of a collapsed group are skipped.
+//! below to the selection. They step through the layer stack, top to bottom: a group comes
+//! before its children, and the children of a collapsed group are included, as in Photoshop
+//! (a recorded Select Backward Layer right after Group Layers lands on the group's top child;
+//! the Layers panel then opens the group to show it).
 
 use photocraft_doc::{Document, Layer, LayerContent, LayerId};
 use serde_json::{Value, json};
@@ -15,15 +17,12 @@ fn has_layers(s: &Session) -> std::result::Result<(), String> {
     if st.doc.layers.is_empty() { Err("the document has no layers".into()) } else { Ok(()) }
 }
 
-/// The Layers panel's rows, top to bottom: each group before its children, collapsed groups
-/// without them.
-pub fn panel_rows(doc: &Document) -> Vec<LayerId> {
+/// Every layer, top to bottom: each group before its children, collapsed or not.
+pub fn stack_rows(doc: &Document) -> Vec<LayerId> {
     fn rec(layers: &[Layer], out: &mut Vec<LayerId>) {
         for l in layers.iter().rev() {
             out.push(l.id);
-            if let LayerContent::Group(g) = &l.content
-                && g.expanded
-            {
+            if let LayerContent::Group(g) = &l.content {
                 rec(&g.children, out);
             }
         }
@@ -31,13 +30,6 @@ pub fn panel_rows(doc: &Document) -> Vec<LayerId> {
     let mut out = Vec::new();
     rec(&doc.layers, &mut out);
     out
-}
-
-/// Where `id` is in `rows`; a layer inside a collapsed group counts as that group's row (the
-/// nearest enclosing one that has a row).
-fn row_of(doc: &Document, rows: &[LayerId], id: LayerId) -> Option<usize> {
-    let path = doc.path_of(id)?;
-    (1..=path.len()).rev().find_map(|n| doc.layer_at(&path[..n]).and_then(|l| rows.iter().position(|r| *r == l.id)))
 }
 
 #[derive(Clone, Copy)]
@@ -52,9 +44,9 @@ enum Step {
 /// At the top or bottom row the selection stays as it is.
 fn navigate(s: &mut Session, step: Step, add: bool) -> Result<Value> {
     let st = s.active().ok_or(EngineError::NoDocument)?;
-    let rows = panel_rows(&st.doc);
+    let rows = stack_rows(&st.doc);
     let last = rows.len().checked_sub(1).ok_or_else(|| EngineError::Other("the document has no layers".into()))?;
-    let current = st.active_layer.and_then(|a| row_of(&st.doc, &rows, a));
+    let current = st.active_layer.and_then(|a| rows.iter().position(|r| *r == a));
     let target = match (step, current) {
         (Step::Top, _) | (Step::Above, None) => 0,
         (Step::Bottom, _) | (Step::Below, None) => last,
@@ -84,7 +76,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 label: $label,
                 menu: &[],
                 shortcut: Some($sc),
-                params: "{} (follows the Layers panel's rows; collapsed groups are one row)",
+                params: "{} (steps through the layer stack, into collapsed groups too)",
                 enabled: has_layers,
                 journal: true,
                 run: |s, _| navigate(s, $step, $add),
@@ -105,7 +97,7 @@ pub fn specs() -> Vec<CommandSpec> {
 mod tests {
     use super::*;
 
-    /// Bottom to top: Background, A, Group { B, C }, D. Panel rows: D, Group, C, B, A, Background.
+    /// Bottom to top: Background, A, Group { B, C }, D. Stack rows: D, Group, C, B, A, Background.
     fn session() -> (Session, [LayerId; 6]) {
         let mut s = Session::new();
         s.execute("file.new", json!({"width": 16, "height": 16})).unwrap();
@@ -130,9 +122,9 @@ mod tests {
     }
 
     #[test]
-    fn steps_follow_the_panel_rows_and_stop_at_the_ends() {
+    fn steps_follow_the_stack_and_stop_at_the_ends() {
         let (mut s, [bg, a, group, b, c, d]) = session();
-        assert_eq!(panel_rows(&s.active().unwrap().doc), vec![d, group, c, b, a, bg]);
+        assert_eq!(stack_rows(&s.active().unwrap().doc), vec![d, group, c, b, a, bg]);
         s.execute("layer.select", json!({"layer": d.0})).unwrap();
         for want in [group, c, b, a, bg, bg] {
             s.execute("layer.selectBelow", json!({})).unwrap();
@@ -149,30 +141,45 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_groups_are_one_row_and_adding_extends_the_selection() {
-        let (mut s, [bg, a, group, _b, c, d]) = session();
-        s.edit("collapse", |doc, _| {
-            if let Some(LayerContent::Group(g)) = doc.layer_mut(group).map(|l| &mut l.content) {
-                g.expanded = false;
-            }
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(panel_rows(&s.active().unwrap().doc), vec![d, group, a, bg]);
-        // A layer inside the collapsed group steps from the group's row.
-        s.execute("layer.select", json!({"layer": c.0})).unwrap();
-        s.execute("layer.selectBelow", json!({})).unwrap();
-        assert_eq!(active(&s), a);
+    fn collapsed_groups_are_stepped_into_and_adding_extends_the_selection() {
+        let (mut s, [bg, a, group, b, c, d]) = session();
+        s.execute("layer.setExpanded", json!({"layer": group.0, "expanded": false})).unwrap();
+        assert_eq!(stack_rows(&s.active().unwrap().doc), vec![d, group, c, b, a, bg]);
+        s.execute("layer.select", json!({"layer": d.0})).unwrap();
+        for want in [group, c] {
+            s.execute("layer.selectBelow", json!({})).unwrap();
+            assert_eq!(active(&s), want);
+        }
+        s.execute("layer.select", json!({"layer": a.0})).unwrap();
         s.execute("layer.addAboveToSelection", json!({})).unwrap();
         s.execute("layer.addAboveToSelection", json!({})).unwrap();
         let mut sel = s.active().unwrap().selected_layers();
         sel.sort();
-        let mut want = vec![a, group, d];
+        let mut want = vec![a, b, c];
         want.sort();
-        assert_eq!((active(&s), sel), (d, want));
+        assert_eq!((active(&s), sel), (c, want));
         s.execute("layer.addBelowToSelection", json!({})).unwrap();
-        assert_eq!(active(&s), group, "the active layer moves; the selection keeps every layer");
+        assert_eq!(active(&s), b, "the active layer moves; the selection keeps every layer");
         assert_eq!(s.active().unwrap().selected_layers().len(), 3);
+    }
+
+    /// The TrueGrit Debaser Ink Distressing actions: Group Layers (which makes a closed group),
+    /// then Select Backward Layer and target its layer mask. Before, the step skipped the closed
+    /// group and landed on the line art, so targeting the mask failed.
+    #[test]
+    fn select_below_after_group_layers_lands_on_the_new_groups_child() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 16, "height": 16})).unwrap();
+        s.execute("layer.new.layer", json!({"name": "Line Art"})).unwrap();
+        s.execute("select.all", json!({})).unwrap();
+        let fill = LayerId(s.execute("layer.newFillLayer.solidColor", json!({"color": "#000000"})).unwrap()["layer"].as_u64().unwrap());
+        let group = LayerId(s.execute("layer.groupLayers", json!({})).unwrap()["layer"].as_u64().unwrap());
+        let doc = &s.active().unwrap().doc;
+        assert!(matches!(&doc.layer(group).unwrap().content, LayerContent::Group(g) if !g.expanded));
+        s.execute("layer.setProps", json!({"blend": "Multiply"})).unwrap();
+        s.execute("layer.selectBelow", json!({})).unwrap();
+        assert_eq!(active(&s), fill);
+        s.execute("channel.target", json!({"channel": "mask"})).unwrap();
     }
 
     #[test]
